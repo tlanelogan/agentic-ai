@@ -215,3 +215,16 @@ are read from a `.env` file in this directory. `.env` is gitignored; see
 `.env.example` for the required variables. Business rules (discount ladder,
 restock/parsing policy, agent step limits) live in the `CONFIG` dataclass near the
 top of `template.py`.
+
+## 8. Optional: operations dashboard (Streamlit)
+
+`app.py` is a portfolio/demo layer over the same agents and database — a chat-style
+interface to submit a request and watch it processed, a live financial dashboard
+(cash, inventory value, top sellers, low-stock alerts), and the evaluation results
+(`test_results.csv`) visualized as charts. It reuses `template.py` unchanged and is
+**not** part of the single-file submission.
+
+```bash
+.venv/bin/python -m pip install streamlit
+.venv/bin/python -m streamlit run app.py     # from this directory, with .env set
+```

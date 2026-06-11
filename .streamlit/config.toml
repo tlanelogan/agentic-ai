@@ -1,0 +1,4 @@
+# Streamlit config for the operations dashboard (app.py).
+[client]
+# Hide the "Deploy" button and developer toolbar items for a clean demo view.
+toolbarMode = "minimal"
