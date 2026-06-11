@@ -1,0 +1,69 @@
+%% Beaver's Choice / Munder Difflin — Multi-Agent Workflow
+%% 5 agents (1 orchestrator + 4 workers). Each tool node names the
+%% starter-code helper function it wraps. Dotted edges = DB read/write.
+flowchart TB
+    Customer(["Customer Request<br/>(free-text items, quantities, deadline + request date)"])
+
+    Orchestrator{{"Orchestrator Agent<br/>- parse request; normalize item names + units to catalog<br/>- decide reorder / affordability / deadline feasibility<br/>- delegate to workers and sequence steps (deterministic)<br/>- assemble customer-facing reply"}}
+
+    Customer -->|"request_with_date"| Orchestrator
+
+    subgraph INV["Inventory Agent  —  stock levels and restock decisions"]
+        direction TB
+        IV1["check_full_inventory()<br/>full snapshot<br/>uses get_all_inventory"]
+        IV2["check_item_stock()<br/>single item<br/>uses get_stock_level"]
+        IV3["estimate_restock_eta()<br/>supplier lead time<br/>uses get_supplier_delivery_date"]
+        IV4["place_restock_order()<br/>buy stock when low<br/>uses create_transaction (stock_orders)"]
+    end
+
+    subgraph QUOTE["Quoting Agent  —  pricing and bulk discounts"]
+        direction TB
+        Q1["find_similar_quotes()<br/>ground price in history<br/>uses search_quote_history"]
+        Q2["price_line_item()<br/>catalog price + bulk discount ladder<br/>(catalog prices, in-code)"]
+    end
+
+    subgraph SALES["Sales / Ordering Agent  —  finalize transactions"]
+        direction TB
+        S1["verify_stock()<br/>confirm availability<br/>uses get_stock_level"]
+        S2["check_funds()<br/>affordability<br/>uses get_cash_balance"]
+        S3["record_sale()<br/>commit the sale<br/>uses create_transaction (sales)"]
+        S4["confirm_delivery_date()<br/>promised date<br/>uses get_supplier_delivery_date"]
+    end
+
+    subgraph ADV["Business Advisor / Reporting Agent  —  financial insight"]
+        direction TB
+        A1["financial_snapshot()<br/>cash, inventory value, top sellers<br/>uses generate_financial_report"]
+        A2["cash_position()<br/>liquidity check<br/>uses get_cash_balance"]
+    end
+
+    %% One bidirectional edge per worker (single label per edge avoids the
+    %% overlapping to/from labels of separate directed edges). Arrows in the
+    %% label show what flows down (→) to the worker and back up (←).
+    Orchestrator <-->|"→ items + qty + date<br/>← stock status + restock ETA"| INV
+    Orchestrator <-->|"→ feasible items<br/>← itemized quote + rationale"| QUOTE
+    Orchestrator <-->|"→ accepted order<br/>← confirmation + delivery date"| SALES
+    Orchestrator <-->|"→ end-of-request review<br/>← reorder + cash recommendations"| ADV
+
+    Orchestrator ==>|"customer reply: quote / confirmation + rationale<br/>(no margins, no internal errors, no PII)"| Customer
+
+    DB[("SQLite: munder_difflin.db<br/>transactions · inventory · quotes · quote_requests")]
+
+    IV1 -. read .-> DB
+    IV2 -. read .-> DB
+    IV4 -. write .-> DB
+    Q1  -. read .-> DB
+    S1  -. read .-> DB
+    S2  -. read .-> DB
+    S3  -. write .-> DB
+    A1  -. read .-> DB
+    A2  -. read .-> DB
+
+    classDef agentBox fill:#1f3a5f,stroke:#0d1b2a,color:#ffffff,font-weight:bold;
+    classDef tool fill:#e8f0fe,stroke:#4285f4,color:#111111;
+    classDef store fill:#fff3cd,stroke:#b8860b,color:#111111;
+    classDef cust fill:#d4edda,stroke:#28a745,color:#111111;
+
+    class Orchestrator agentBox;
+    class IV1,IV2,IV3,IV4,Q1,Q2,S1,S2,S3,S4,A1,A2 tool;
+    class DB store;
+    class Customer cust;

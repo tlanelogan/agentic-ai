@@ -1,0 +1,15 @@
+# Secrets — never commit real credentials (this repo is public)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated at runtime (reproducible from template.py)
+munder_difflin.db
+
+# Local tooling
+.puppeteer.json
+.DS_Store
