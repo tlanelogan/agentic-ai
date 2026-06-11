@@ -88,10 +88,12 @@ Two further reliability mechanisms back this up:
   `ToolResult` dict (`status` / `error_type` / `data` / `message`) and wraps its
   helper call in `try/except`; raw exceptions and internal text never reach the
   customer.
-- **Graceful degradation.** A line that can't be fulfilled (not carried,
-  deadline infeasible, unaffordable restock) is declined with a clear reason
-  while the rest of the order proceeds; a failed worker call is contained so one
-  bad request never aborts the 20-request run.
+- **Bounded retries, then graceful degradation.** Worker calls get a few retries
+  with backoff on transient model/tool failures (`CONFIG.max_retries`); if they
+  still fail, the call is contained and the deterministic fallbacks take over. A
+  line that can't be fulfilled (not carried, deadline infeasible, unaffordable
+  restock) is declined with a clear reason while the rest of the order proceeds,
+  so one bad line — or one bad request — never aborts the run.
 - **Validation between stages.** Item names are normalized and validated against
   the catalog before any transaction; the orchestrator branches on each tool's
   `status`.
@@ -198,7 +200,15 @@ cp .env.example .env        # then edit .env (OPENAI_API_KEY, OPENAI_BASE_URL, O
 
 # Run the full evaluation (must be run from this directory):
 .venv/bin/python template.py     # writes test_results.csv
+
+# Run the deterministic unit tests (no model calls, stdlib unittest):
+.venv/bin/python -m unittest test_template -v
 ```
+
+Run `template.py` in an **interactive terminal** to see an animated per-request view
+(via `rich`) — the agent pipeline reveals stage by stage, then the customer reply
+and a financial summary. Piped or non-TTY runs (e.g. CI, redirect to a file) stay
+plain text and are behaviour-identical.
 
 Credentials and the model id (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`)
 are read from a `.env` file in this directory. `.env` is gitignored; see

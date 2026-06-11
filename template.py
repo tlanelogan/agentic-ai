@@ -599,11 +599,23 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 # gitignored — see .env.example for the variables it must define.
 # =============================================================================
 import re
+import sys
 import difflib
 from typing import Optional, Any
 from dataclasses import dataclass, field, asdict
 
 from smolagents import ToolCallingAgent, OpenAIServerModel, tool
+
+# Optional rich UI for an animated terminal view (Phase 7). Degrades gracefully:
+# when rich is unavailable or output is not a TTY, the run uses plain text and the
+# batch behaviour is byte-for-byte unchanged.
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    _RICH_AVAILABLE = True
+except ImportError:
+    _RICH_AVAILABLE = False
 
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 dotenv.load_dotenv(dotenv_path=_ENV_PATH)
@@ -647,6 +659,9 @@ class Config:
     max_tool_threads: int = 1       # serialize tool calls to avoid DB write races
     # Run the advisor agent every Nth request (bounds run cost).
     advisor_every: int = 10
+    # Bounded retries for transient model/tool failures before graceful degradation.
+    max_retries: int = 2
+    retry_backoff_seconds: float = 2.0
 
 
 CONFIG = Config()
@@ -1222,6 +1237,50 @@ def _agent_tool_calls(agent, tool_name: str) -> list:
     return calls
 
 
+# =============================================================================
+# Progress reporting (Phase 7 stand-out: animated terminal view)
+# =============================================================================
+class Reporter:
+    """No-op progress reporter. Used for batch / non-TTY runs so behaviour is
+    identical to running without any UI."""
+    def start_request(self, idx, context, date, cash, inventory): pass
+    def stage(self, name, status="done", detail=""): pass
+    def finish(self, reply, summary): pass
+
+
+class RichReporter(Reporter):
+    """Animated terminal view of how each request flows through the agents. Stages
+    reveal sequentially as the request is processed (paced by real agent latency),
+    then the customer reply and a one-line financial summary are shown."""
+
+    _ICON = {"done": "[green]check[/]", "skip": "[dim]-[/]"}
+
+    def __init__(self, console):
+        self.console = console
+
+    def start_request(self, idx, context, date, cash, inventory):
+        self.console.rule(f"[bold cyan]Request {idx}[/]  -  {context}  -  {date}")
+        self.console.print(
+            f"[dim]opening position: cash ${cash:,.0f} - inventory ${inventory:,.0f}[/]")
+
+    def stage(self, name, status="done", detail=""):
+        line = f"  {self._ICON.get(status, '[cyan]*[/]')} [bold]{name}[/]"
+        if detail:
+            line += f"  [dim]{detail}[/]"
+        self.console.print(line)
+
+    def finish(self, reply, summary):
+        fulfilled = summary.get("fulfilled")
+        title = "[green]order fulfilled[/]" if fulfilled else "[yellow]nothing fulfilled[/]"
+        border = "green" if fulfilled else "yellow"
+        self.console.print(Panel(Text(reply), title=f"Customer reply - {title}",
+                                 border_style=border, expand=False))
+        self.console.print(
+            f"[dim]lines {summary.get('num_lines_fulfilled', 0)}/{summary.get('num_lines_requested', 0)}"
+            f" - charged ${summary.get('total_charged', 0):,.2f}"
+            f" - delivery {summary.get('delivery_date') or 'n/a'}[/]\n")
+
+
 class Orchestrator(ToolCallingAgent):
     """Supervises order handling and delegates to four specialised worker agents.
 
@@ -1326,15 +1385,26 @@ class Orchestrator(ToolCallingAgent):
         self._req_count = 0
         self.advisor_every = CONFIG.advisor_every   # run the advisor agent every Nth request
         self.last_summary = {}          # structured per-request result for test_results.csv
+        self.reporter = Reporter()      # no-op by default; set to RichReporter for TTY demos
 
     # ------------------------------------------------------------------ #
     def _safe_run(self, agent, prompt: str) -> Optional[str]:
-        """Run a worker agent, containing any failure (graceful degradation)."""
-        try:
-            return str(agent.run(prompt))
-        except Exception as exc:
-            print(f"[WARN] {agent.name} failed: {type(exc).__name__}: {exc}")
-            return None
+        """Run a worker agent with bounded retries, then contain any failure.
+
+        Transient model/tool errors (rate limits, timeouts) get a few retries with
+        a short backoff; if they all fail we degrade gracefully (return None) so the
+        deterministic fallbacks and per-line declines keep the request moving.
+        """
+        for attempt in range(1, CONFIG.max_retries + 1):
+            try:
+                return str(agent.run(prompt))
+            except Exception as exc:
+                print(f"[WARN] {agent.name} attempt {attempt}/{CONFIG.max_retries} "
+                      f"failed: {type(exc).__name__}: {exc}")
+                if attempt < CONFIG.max_retries:
+                    time.sleep(CONFIG.retry_backoff_seconds * attempt)
+        print(f"[WARN] {agent.name} gave up after {CONFIG.max_retries} attempts; degrading.")
+        return None
 
     def process_request(self, request_with_date: str) -> str:
         """Handle one customer request end-to-end and return the customer-facing reply."""
@@ -1357,6 +1427,7 @@ class Orchestrator(ToolCallingAgent):
             else:
                 declined.append({"raw": ln["raw_name"], "reason": "we do not currently carry this item",
                                  "code": "not_in_catalog"})
+        self.reporter.stage("Parse", "done", f"{len(lines)} line(s), {len(resolved)} in catalog")
 
         # 2) Inventory + restock decisions (deterministic gates).
         restock_plan = []
@@ -1391,6 +1462,7 @@ class Orchestrator(ToolCallingAgent):
             for name, qty in restock_plan:
                 if _stock_level(name, date) < qty:            # agent missed it -> fill the gap
                     _place_restock_impl(name, qty, date)
+        self.reporter.stage("Inventory", "done", f"{len(restock_plan)} restock(s)")
 
         # 4) Quote feasible lines. Retrieval-augmented pricing: comparable past quotes
         #    set a historical discount benchmark, and the agent also consults history.
@@ -1401,6 +1473,8 @@ class Orchestrator(ToolCallingAgent):
                            "Review past pricing with find_similar_quotes, then summarise a fair "
                            "rationale for an order of: "
                            + ", ".join(l["catalog_name"] for l in feasible) + ".")
+        self.reporter.stage("Quote", "done" if feasible else "skip",
+                            f"{hist_n} comparable past quote(s)" if hist_n else "")
 
         # 5) Finalise sales via the sales agent; reconcile against the DB (fallback fills gaps).
         sale_payload = []
@@ -1435,11 +1509,15 @@ class Orchestrator(ToolCallingAgent):
                 if not _already_recorded(s["item"], s["qty"]):
                     _record_sale_impl(s["item"], s["qty"], s["line_total"], date)
                 fulfilled.append(s)
+        self.reporter.stage("Sales", "done" if fulfilled else "skip",
+                            f"{len(fulfilled)} line(s) sold")
 
         # 6) Advisor review (internal only) -- exercised periodically to bound cost.
-        if self._req_count % self.advisor_every == 0:
+        advisor_ran = self._req_count % self.advisor_every == 0
+        if advisor_ran:
             self._safe_run(self.advisor_agent,
                            f"Give an internal financial snapshot and one recommendation as of {date}.")
+        self.reporter.stage("Advisor", "done" if advisor_ran else "skip")
 
         # 7) Promised delivery date = latest line ETA among fulfilled items.
         delivery_date = ""
@@ -1526,21 +1604,28 @@ def run_test_scenarios():
     # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
     ############
     orchestrator = Orchestrator(model)
+    rich_mode = _RICH_AVAILABLE and sys.stdout.isatty()   # animated view only for interactive TTY
+    if rich_mode:
+        orchestrator.reporter = RichReporter(Console(highlight=False))
     print("Multi-agent system ready (Orchestrator + Inventory/Quoting/Sales/Advisor).\n")
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
         request_date = row["request_date"].strftime("%Y-%m-%d")
 
-        print(f"\n=== Request {idx+1} ===")
-        print(f"Context: {row['job']} organizing {row['event']}")
-        print(f"Request Date: {request_date}")
-        print(f"Cash Balance: ${current_cash:.2f}")
-        print(f"Inventory Value: ${current_inventory:.2f}")
-
         # Process request
         request_with_date = f"{row['request']} (Date of request: {request_date})"
         cash_before = current_cash
+        context = f"{row['job']} organizing {row['event']}"
+        if rich_mode:
+            orchestrator.reporter.start_request(idx + 1, context, request_date,
+                                                current_cash, current_inventory)
+        else:
+            print(f"\n=== Request {idx+1} ===")
+            print(f"Context: {context}")
+            print(f"Request Date: {request_date}")
+            print(f"Cash Balance: ${current_cash:.2f}")
+            print(f"Inventory Value: ${current_inventory:.2f}")
 
         ############
         # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
@@ -1563,9 +1648,12 @@ def run_test_scenarios():
         current_inventory = report["inventory_value"]
         cash_change = round(current_cash - cash_before, 2)
 
-        print(f"Response: {response}")
-        print(f"Updated Cash: ${current_cash:.2f}  (change: ${cash_change:+.2f})")
-        print(f"Updated Inventory: ${current_inventory:.2f}")
+        if rich_mode:
+            orchestrator.reporter.finish(response, summary)
+        else:
+            print(f"Response: {response}")
+            print(f"Updated Cash: ${current_cash:.2f}  (change: ${cash_change:+.2f})")
+            print(f"Updated Inventory: ${current_inventory:.2f}")
 
         results.append(
             {
