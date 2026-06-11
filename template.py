@@ -628,6 +628,10 @@ model = OpenAIServerModel(
 class Config:
     # Bulk-discount ladder: (minimum quantity, discount fraction), highest first.
     discount_tiers: tuple = ((1000, 0.08), (500, 0.05), (100, 0.02))
+    # Cap on any single line's total discount (bulk ladder + historical benchmark).
+    max_discount: float = 0.15
+    # How many comparable past quotes to retrieve for the historical price benchmark.
+    history_quote_limit: int = 5
     # difflib ratio below which a fuzzy item name is treated as "not carried".
     fuzzy_match_cutoff: float = 0.62
     # Bulk-unit -> catalog (sheet) multipliers for paper/specialty items.
@@ -711,6 +715,53 @@ def bulk_discount(quantity: int) -> float:
         if quantity >= threshold:
             return fraction
     return 0.0
+
+
+# Event keywords used to find comparable historical quotes for the pricing benchmark.
+_EVENT_TERMS = ("wedding", "party", "ceremony", "meeting", "exhibition", "reception",
+                "conference", "graduation", "fundraiser", "gala", "celebration",
+                "launch", "seminar", "workshop", "festival", "demonstration", "event")
+
+
+def _extract_discount_fractions(quotes: list) -> list:
+    """Discount fractions explicitly stated in historical quote text (only when the
+    text actually mentions a discount), kept to the plausible (0, 0.5] range."""
+    fractions = []
+    for q in quotes:
+        text = f"{q.get('quote_explanation', '')} {q.get('original_request', '')}".lower()
+        if "discount" not in text:
+            continue
+        for pct in re.findall(r"(\d{1,2})\s*%", text):
+            value = int(pct) / 100.0
+            if 0 < value <= 0.5:
+                fractions.append(value)
+    return fractions
+
+
+def historical_discount(search_terms: list):
+    """Retrieval-augmented pricing benchmark: the average explicit discount used in
+    comparable past quotes. Returns (fraction, n_quotes_with_discount); the fraction
+    is 0.0 when nothing comparable is found, so the quote falls back to the ladder."""
+    terms = [t for t in (search_terms or []) if t][:2]
+    try:
+        quotes = search_quote_history(terms, limit=CONFIG.history_quote_limit)
+    except Exception:
+        return 0.0, 0
+    fractions = _extract_discount_fractions(quotes)
+    if not fractions:
+        return 0.0, 0
+    return min(sum(fractions) / len(fractions), CONFIG.max_discount), len(fractions)
+
+
+def search_terms_for(request_text: str, feasible: list) -> list:
+    """Pick one broad retrieval keyword: an event word if present, else the top item."""
+    lowered = request_text.lower()
+    for term in _EVENT_TERMS:
+        if term in lowered:
+            return [term]
+    if feasible:
+        return [feasible[0]["catalog_name"].split()[0].lower()]
+    return []
 
 
 # =============================================================================
@@ -893,8 +944,11 @@ def parse_line_items(text: str) -> list:
     for m in line_re.finditer(text):
         qty = int(m.group(1).replace(",", ""))
         unit = (m.group(2) or "").lower()
-        # Trim trailing prepositional clauses ("... for our reception", "... before May").
-        raw_name = re.split(r"\b(?:by|on|delivered|for|before)\b", m.group(3))[0].strip(" .,")
+        # Trim trailing prepositional clauses ("... for our reception") and any
+        # trailing list connector ("..., and", "... plus") the capture grabbed.
+        raw_name = re.split(r"\b(?:by|on|delivered|for|before)\b", m.group(3))[0]
+        raw_name = re.sub(r"[\s,]+(?:and|plus|along\s+with|as\s+well\s+as)\s*$", "",
+                          raw_name, flags=re.IGNORECASE).strip(" .,")
         # Require a real word so stray numbers are not treated as items.
         if not re.search(r"[A-Za-z]{3,}", raw_name):
             continue
@@ -1020,17 +1074,21 @@ def place_restock_order(item_name: str, quantity: int, order_date: str) -> dict:
 # ---- Quoting agent tools ----
 @tool
 def find_similar_quotes(search_term: str) -> dict:
-    """Look up up to 3 past quotes for ONE broad keyword (wraps search_quote_history).
+    """Look up comparable past quotes for ONE broad keyword and report the average
+    explicit discount they applied (wraps search_quote_history).
 
     Args:
         search_term: a single broad keyword (e.g. an event type like 'wedding').
     """
     try:
         terms = [search_term.strip().lower()] if search_term and search_term.strip() else []
-        history = search_quote_history(terms, limit=3)
+        history = search_quote_history(terms, limit=CONFIG.history_quote_limit)
+        fractions = _extract_discount_fractions(history)
+        avg_discount_pct = round(sum(fractions) / len(fractions) * 100, 1) if fractions else 0.0
         slim = [{"total_amount": h.get("total_amount"), "order_size": h.get("order_size"),
                  "event_type": h.get("event_type")} for h in history]
-        return ok(matches=slim, count=len(slim))
+        return ok(matches=slim, count=len(slim),
+                  avg_discount_pct=avg_discount_pct, n_with_discount=len(fractions))
     except Exception as exc:
         return err("db_error", f"quote history lookup failed: {exc}")
 
@@ -1334,10 +1392,14 @@ class Orchestrator(ToolCallingAgent):
                 if _stock_level(name, date) < qty:            # agent missed it -> fill the gap
                     _place_restock_impl(name, qty, date)
 
-        # 4) Quote the feasible lines (numbers are deterministic; agent grounds in history).
+        # 4) Quote feasible lines. Retrieval-augmented pricing: comparable past quotes
+        #    set a historical discount benchmark, and the agent also consults history.
+        hist_frac, hist_n = 0.0, 0
         if feasible:
+            hist_frac, hist_n = historical_discount(search_terms_for(request_with_date, feasible))
             self._safe_run(self.quoting_agent,
-                           "Review past pricing and summarise a fair rationale for an order of: "
+                           "Review past pricing with find_similar_quotes, then summarise a fair "
+                           "rationale for an order of: "
                            + ", ".join(l["catalog_name"] for l in feasible) + ".")
 
         # 5) Finalise sales via the sales agent; reconcile against the DB (fallback fills gaps).
@@ -1345,12 +1407,16 @@ class Orchestrator(ToolCallingAgent):
         for ln in feasible:
             name, qty = ln["catalog_name"], ln["qty_units"]
             unit_price = catalog_price(name)
-            discount = bulk_discount(qty)
+            # Discount = larger of the bulk ladder and the historical benchmark, capped.
+            # History can only make us more competitive, never less.
+            bulk = bulk_discount(qty)
+            discount = min(max(bulk, hist_frac), CONFIG.max_discount)
             sale_payload.append({
                 "item": name, "qty": qty, "unit_price": unit_price,
                 "discount_pct": round(discount * 100), "raw": ln["raw_name"],
                 "line_total": round(unit_price * qty * (1 - discount), 2),
                 "conversion_note": ln["conversion_note"],
+                "history_applied": hist_n > 0 and hist_frac > bulk,
             })
 
         if sale_payload:
@@ -1390,9 +1456,10 @@ class Orchestrator(ToolCallingAgent):
             "total_charged": total_charged,
             "delivery_date": delivery_date,
         }
-        return self._assemble_reply(fulfilled, declined, total_charged, delivery_date)
+        return self._assemble_reply(fulfilled, declined, total_charged, delivery_date, hist_n)
 
-    def _assemble_reply(self, fulfilled: list, declined: list, total: float, delivery_date: str) -> str:
+    def _assemble_reply(self, fulfilled: list, declined: list, total: float,
+                        delivery_date: str, history_n: int = 0) -> str:
         """Build the transparent, customer-safe reply (no margins / cash / raw errors / PII)."""
         parts = []
         if fulfilled:
@@ -1403,7 +1470,9 @@ class Orchestrator(ToolCallingAgent):
                         f"= ${f['line_total']:,.2f}")
                 extras = []
                 if f["discount_pct"] > 0:
-                    extras.append(f"{f['discount_pct']:.0f}% bulk discount")
+                    label = ("bulk + historical-benchmark discount"
+                             if f.get("history_applied") else "bulk discount")
+                    extras.append(f"{f['discount_pct']:.0f}% {label}")
                 if "=" in f.get("conversion_note", ""):       # show ream/box -> sheet conversions
                     extras.append(f["conversion_note"])
                 if extras:
@@ -1412,6 +1481,9 @@ class Orchestrator(ToolCallingAgent):
             parts.append(f"Order total: ${total:,.2f}")
             if delivery_date:
                 parts.append(f"Estimated delivery by: {delivery_date}")
+            if history_n and any(f.get("history_applied") for f in fulfilled):
+                parts.append(f"Pricing was benchmarked against {history_n} comparable past "
+                             f"order{'s' if history_n != 1 else ''}.")
         if declined:
             parts.append("We're sorry, but we could not fulfil the following:"
                          if fulfilled else
